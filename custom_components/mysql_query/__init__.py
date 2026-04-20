@@ -1,11 +1,9 @@
-"""The MySQL Query Service integration."""
 from __future__ import annotations
 
 import logging
 import time
 import mysql.connector
-from mysql.connector import Error
-from functools import partial
+from mysql.connector import Error, pooling
 from typing import Any, Final
 
 from homeassistant.config_entries import ConfigEntry
@@ -16,23 +14,10 @@ import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 
 from .const import (
-    DOMAIN,
-    SERVICE_QUERY,
-    SERVICE_EXECUTE,
-    ATTR_QUERY,
-    ATTR_DB4QUERY,
-    ATTR_CONFIG_ENTRY,
-    CONF_MYSQL_HOST,
-    CONF_MYSQL_PORT,
-    CONF_MYSQL_USERNAME,
-    CONF_MYSQL_PASSWORD,
-    CONF_MYSQL_DB,
-    CONF_MYSQL_TIMEOUT,
-    CONF_MYSQL_CHARSET,
-    CONF_MYSQL_COLLATION,
-    CONF_AUTOCOMMIT,
-    CONF_ROW_LIMIT,
-    DEFAULT_ROW_LIMIT,
+    DOMAIN, SERVICE_QUERY, SERVICE_EXECUTE, ATTR_QUERY, ATTR_DB4QUERY,
+    ATTR_CONFIG_ENTRY, CONF_MYSQL_HOST, CONF_MYSQL_PORT, CONF_MYSQL_USERNAME,
+    CONF_MYSQL_PASSWORD, CONF_MYSQL_DB, CONF_MYSQL_TIMEOUT, CONF_MYSQL_CHARSET,
+    CONF_MYSQL_COLLATION, CONF_AUTOCOMMIT, CONF_ROW_LIMIT, DEFAULT_ROW_LIMIT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,7 +33,6 @@ SERVICE_SCHEMA: Final = vol.Schema(
 )
 
 def replace_blob_with_description(value: Any) -> Any:
-    """Replace binary data with a string description for JSON compatibility."""
     if isinstance(value, (bytes, bytearray)):
         return "BLOB"
     elif isinstance(value, memoryview):
@@ -57,64 +41,51 @@ def replace_blob_with_description(value: Any) -> Any:
         return value
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the mysql_query component from YAML (Legacy/Import)."""
     if DOMAIN in config:
         hass.async_create_task(
             hass.config_entries.flow.async_init(
-                DOMAIN,
-                context={"source": "import"},
-                data=config[DOMAIN],
+                DOMAIN, context={"source": "import"}, data=config[DOMAIN],
             )
         )
     return True
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up mysql_query from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     config = entry.data
 
-    def connect():
-        """Establish a connection with safe defaults for optional fields."""
-        db_host = config.get(CONF_MYSQL_HOST)
-        db_port = config.get(CONF_MYSQL_PORT, 3306)
-        db_user = config.get(CONF_MYSQL_USERNAME)
-        db_pass = config.get(CONF_MYSQL_PASSWORD)
-        db_name = config.get(CONF_MYSQL_DB)
-
-        conn_args = {
-            "host": db_host,
-            "port": int(db_port),
-            "user": db_user,
-            "password": db_pass,
-            "database": db_name,
-            "connection_timeout": int(config.get(CONF_MYSQL_TIMEOUT, 10)),
-            "autocommit": bool(config.get(CONF_AUTOCOMMIT, True)),
-        }
-
-        charset = config.get(CONF_MYSQL_CHARSET)
-        if charset:
-            conn_args["charset"] = charset
-
-        collation = config.get(CONF_MYSQL_COLLATION)
-        if collation:
-            conn_args["collation"] = collation
-
-        _LOGGER.info(f"Establishing connection with database {db_name} at {db_host}:{db_port}")
-        return mysql.connector.connect(**conn_args)
+    db_config = {
+        "host": config.get(CONF_MYSQL_HOST),
+        "port": int(config.get(CONF_MYSQL_PORT, 3306)),
+        "user": config.get(CONF_MYSQL_USERNAME),
+        "password": config.get(CONF_MYSQL_PASSWORD),
+        "database": config.get(CONF_MYSQL_DB),
+        "connect_timeout": int(config.get(CONF_MYSQL_TIMEOUT, 10)),
+        "autocommit": bool(config.get(CONF_AUTOCOMMIT, True)),
+    }
+    
+    charset = config.get(CONF_MYSQL_CHARSET)
+    if charset: db_config["charset"] = charset
+    collation = config.get(CONF_MYSQL_COLLATION)
+    if collation: db_config["collation"] = collation
 
     try:
-        cnx = await hass.async_add_executor_job(connect)
+        db_pool = await hass.async_add_executor_job(
+            lambda: pooling.MySQLConnectionPool(
+                pool_name=f"pool_{entry.entry_id}",
+                pool_size=5,
+                **db_config
+            )
+        )
         hass.data[DOMAIN][entry.entry_id] = {
-            "cnx": cnx,
+            "pool": db_pool,
             "config": config,
             "title": entry.title
         }
-    except Exception as e:
-        _LOGGER.error("Could not connect to mysql server for %s: %s", entry.title, str(e), exc_info=True)
+    except Error as e:
+        _LOGGER.error("Could not create connection pool for %s: %s", entry.title, str(e))
         return False
 
     async def async_handle_service(call: ServiceCall) -> ServiceResponse:
-        """Handle service calls with instance selection and row limiting."""
         _query = call.data[ATTR_QUERY]
         _db4query = call.data.get(ATTR_DB4QUERY)
         target_entry_id = call.data.get(ATTR_CONFIG_ENTRY)
@@ -127,14 +98,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not instance:
             raise HomeAssistantError("No database instance available.")
 
-        _cnx = instance["cnx"]
+        pool = instance["pool"]
         inst_config = instance["config"]
         mysql_db = inst_config.get(CONF_MYSQL_DB)
         target_db_name = _db4query if (_db4query and _db4query != "") else mysql_db
-        
         row_limit = int(inst_config.get(CONF_ROW_LIMIT, DEFAULT_ROW_LIMIT))
-        if row_limit < 1:
-            row_limit = DEFAULT_ROW_LIMIT
 
         response = {
             "succeeded": False, "execution_time_ms": 0, "database": target_db_name,
@@ -143,43 +111,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "generated_id": None, "column_names": [],
             "error": {"message": None, "errno": None, "sqlstate": None}, "result": []
         }
-
+        
         start_time = time.perf_counter()
 
         def execute_on_db():
-            active_cnx = _cnx
-            if _db4query and str(_db4query).lower() != str(mysql_db).lower():
-                temp_kwargs = {
-                    "host": inst_config.get(CONF_MYSQL_HOST),
-                    "user": inst_config.get(CONF_MYSQL_USERNAME),
-                    "password": inst_config.get(CONF_MYSQL_PASSWORD),
-                    "database": _db4query,
-                    "port": int(inst_config.get(CONF_MYSQL_PORT, 3306)),
-                }
-                active_cnx = mysql.connector.connect(**temp_kwargs)
+            is_same_db = not _db4query or str(_db4query).lower() == str(mysql_db).lower()
+            
+            if is_same_db:
+                active_cnx = pool.get_connection()
             else:
-                if not active_cnx.is_connected():
-                    active_cnx.ping(reconnect=True)
+                active_cnx = mysql.connector.connect(
+                    host=inst_config.get(CONF_MYSQL_HOST),
+                    port=int(inst_config.get(CONF_MYSQL_PORT, 3306)),
+                    user=inst_config.get(CONF_MYSQL_USERNAME),
+                    password=inst_config.get(CONF_MYSQL_PASSWORD),
+                    database=_db4query
+                )
 
             try:
-                _cursor = active_cnx.cursor(buffered=True, dictionary=True)
-                _cursor.execute(_query)
-
+                cursor = active_cnx.cursor(buffered=True, dictionary=True)
+                cursor.execute(_query)
+                
                 res_list = []
                 cols = []
-                is_select = _cursor.with_rows
+                is_select = cursor.with_rows
 
                 if is_select:
-                    cols = list(_cursor.column_names)
-                    rows = _cursor.fetchmany(size=row_limit)
+                    cols = list(cursor.column_names)
+                    rows = cursor.fetchmany(size=row_limit)
                     for row in rows:
                         res_list.append({k: replace_blob_with_description(v) for k, v in row.items()})
-                    
-                    if _cursor.fetchone():
-                        _LOGGER.warning(
-                            "Query in %s afgebroken: Resultaatset overschrijdt de limiet van %s rijen.",
-                            target_db_name, row_limit
-                        )
 
                 if not is_select:
                     active_cnx.commit()
@@ -187,17 +148,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return {
                     "res": res_list,
                     "cols": cols,
-                    "rows_found": _cursor.rowcount if is_select else None,
+                    "rows_found": cursor.rowcount if is_select else None,
                     "rows_returned": len(res_list) if is_select else None,
-                    "rows_affected": _cursor.rowcount if not is_select else None,
-                    "gen_id": _cursor.lastrowid if _cursor.lastrowid != 0 else None,
-                    "statement": _cursor.statement
+                    "rows_affected": cursor.rowcount if not is_select else None,
+                    "gen_id": cursor.lastrowid if cursor.lastrowid != 0 else None,
+                    "statement": cursor.statement
                 }
             finally:
-                _cursor.close()
-                if active_cnx is not _cnx:
-                    active_cnx.close()
-
+                cursor.close()
+                active_cnx.close()
         try:
             db_output = await hass.async_add_executor_job(execute_on_db)
             response.update({
@@ -228,15 +187,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 raise HomeAssistantError(f"Error: {str(e)}")
             response["error"]["message"] = str(e)
             return response
-
+            
     hass.services.async_register(DOMAIN, SERVICE_QUERY, async_handle_service, schema=SERVICE_SCHEMA, supports_response=SupportsResponse.ONLY)
     hass.services.async_register(DOMAIN, SERVICE_EXECUTE, async_handle_service, schema=SERVICE_SCHEMA, supports_response=SupportsResponse.ONLY)
 
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    instance = hass.data[DOMAIN].pop(entry.entry_id, None)
-    if instance and instance["cnx"].is_connected():
-        await hass.async_add_executor_job(instance["cnx"].close)
+    hass.data[DOMAIN].pop(entry.entry_id, None)
     return True
