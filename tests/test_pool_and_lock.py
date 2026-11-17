@@ -272,45 +272,40 @@ async def test_db4query_drops_connection_when_restore_fails(
     assert connection.closed
 
 
-async def test_concurrent_calls_are_serialised_by_the_lock(
+async def test_concurrent_calls_run_in_parallel(
     hass: HomeAssistant,
 ) -> None:
-    """A second call waits for the first to finish before it touches MySQL."""
+    """Kristall: calls on one entry do not wait for each other.
+
+    Each borrows its own connection from the pool; a slow statement no longer
+    holds up every other call of the entry.
+    """
     started: list[str] = []
-    finished: list[str] = []
     release_first = asyncio.Event()
 
     async def on_execute(query: str) -> None:
         started.append(query)
         if query == "SELECT 1":
-            # Hold the lock until the test lets go.
             await release_first.wait()
-        finished.append(query)
 
     connection = FakeConnection(_cursor(on_execute=on_execute))
     pool = FakePool(connection)
     await _setup_entry(hass, pool)
 
     first = _call(hass, "SELECT 1")
-    # Let the first call reach the database and block there.
     while not started:
         await asyncio.sleep(0)
 
     second = _call(hass, "SELECT 2")
-    # Give the second call every chance to slip past the first one.
     for _ in range(20):
         await asyncio.sleep(0)
 
-    assert started == ["SELECT 1"], "second call ran while the first held the lock"
-    assert pool.acquired == 1
+    # The second call reached the database while the first was still running.
+    assert started == ["SELECT 1", "SELECT 2"]
+    assert (await second)["result"] == [{"id": 1}]
 
     release_first.set()
     assert (await first)["result"] == [{"id": 1}]
-    assert (await second)["result"] == [{"id": 1}]
-
-    # Strictly sequential: the first finished before the second started.
-    assert started == ["SELECT 1", "SELECT 2"]
-    assert finished == ["SELECT 1", "SELECT 2"]
     assert pool.acquired == 2
     assert pool.released == 2
 

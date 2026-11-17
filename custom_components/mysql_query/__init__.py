@@ -121,9 +121,8 @@ class MySQLInstance:
     # Set by the user on the connection itself. A hard boundary: it refuses
     # execute without looking at the statement at all.
     read_only: bool = False
-    # One lock per config entry. Home Assistant can fire several service calls
-    # at the same time, and MySQL only handles one statement per connection at
-    # a time, so the lock keeps the calls from interleaving.
+    # Kept for compatibility; no longer taken (each call has its own pooled
+    # connection, see _async_handle_service).
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -746,22 +745,26 @@ async def _async_handle_service(
         return _service_response(call, response)
 
     try:
-        # Serialise the calls on this entry: without the lock two service
-        # calls would push their statements onto the same connection at
-        # the same time and read each other's results.
-        async with instance.lock:
-            start_time = time.perf_counter()
-            db_output = await _async_run_statement(
-                instance,
-                _query,
-                _db4query,
-                row_limit,
-                bind_values(_values),
-                # Only reading belongs to query, so the server is told to hold
-                # it to that. Execute has to be able to write.
-                read_only=call.service == SERVICE_QUERY,
-            )
-            execution_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        # Kristall: no per-entry lock. Every call borrows its own connection
+        # from the pool (up to POOL_MAX_SIZE at once), so two calls never share
+        # a connection and cannot read each other's results. Upstream v4
+        # serialised all calls of an entry behind one asyncio.Lock: with several
+        # dashboards loading at once every call queued behind the others, and
+        # the wait for the lock was not covered by the query timeout, so a slow
+        # statement held up every other call without limit. Waiting for a free
+        # connection is bounded by the query timeout inside _async_run_statement.
+        start_time = time.perf_counter()
+        db_output = await _async_run_statement(
+            instance,
+            _query,
+            _db4query,
+            row_limit,
+            bind_values(_values),
+            # Only reading belongs to query, so the server is told to hold
+            # it to that. Execute has to be able to write.
+            read_only=call.service == SERVICE_QUERY,
+        )
+        execution_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         response.update(
             {
@@ -867,10 +870,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: MySQLQueryConfigEntry) 
     """
     instance = entry.runtime_data
 
-    # Taking the lock first lets a service call that is still running finish
-    # before its connection is pulled out from under it.
-    async with instance.lock:
-        instance.pool.close()
-        await instance.pool.wait_closed()
+    # wait_closed() waits until every borrowed connection is released, so a
+    # service call that is still running finishes before its pool goes away.
+    instance.pool.close()
+    await instance.pool.wait_closed()
 
     return True
