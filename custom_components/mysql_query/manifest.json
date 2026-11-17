@@ -2,18 +2,18 @@
   "domain": "mysql_query",
   "name": "MySQL Query Service",
   "codeowners": [
-    "@IAsDoubleYou"
+    "@Lordhmen"
   ],
   "config_flow": true,
-  "documentation": "https://github.com/IAsDoubleYou/homeassistant-mysql_query",
+  "documentation": "https://github.com/Lordhmen/homeassistant-mysql_query",
   "integration_type": "service",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/IAsDoubleYou/homeassistant-mysql_query/issues",
+  "issue_tracker": "https://github.com/Lordhmen/homeassistant-mysql_query/issues",
   "loggers": [
     "aiomysql"
   ],
   "requirements": [
     "aiomysql==0.3.2"
   ],
-  "version": "4.2.1"
+  "version": "4.2.1.1"
 }
